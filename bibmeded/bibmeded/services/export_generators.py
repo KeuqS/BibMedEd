@@ -9,11 +9,13 @@ import io
 import json
 import re
 import zipfile
-from datetime import date
+from collections import Counter
+from datetime import date, datetime, timezone
 
-from bibmeded.models import Publication
+from bibmeded.models import Publication, ScreeningDecision
 from bibmeded.models.methodology import MethodologyStep
 from bibmeded.services.prisma import ExclusionSummary, compute_counts, render_svg, summarize_exclusions
+from bibmeded.services.screening import BULK_EXCLUDE_PHASE, BULK_EXCLUDE_SOURCE, ScreeningDecisionLog
 
 
 _PHASE_LABELS = {
@@ -162,9 +164,9 @@ def _plural(n: int, noun: str) -> str:
     return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
 
 
-def _reason_count_lines(by_reason: dict[str, int]) -> list[str]:
+def _reason_count_lines(by_reason: dict[str, int], indent: str = "    ") -> list[str]:
     return [
-        f"    {EXCLUSION_REASON_LABELS.get(reason, reason)}: {n}"
+        f"{indent}{EXCLUSION_REASON_LABELS.get(reason, reason)}: {n}"
         for reason, n in sorted(by_reason.items(), key=lambda kv: (-kv[1], kv[0]))
     ]
 
@@ -196,10 +198,211 @@ def _screening_stage_lines(exclusion_summary: ExclusionSummary | None) -> list[s
     return lines
 
 
+DECISIONS_REVISION = "0006_screening_decisions"
+_STAGE_LABELS = {"title_abstract": "Title/abstract", "full_text": "Full text", None: "No stage recorded"}
+_NO_REASON_LABEL = "No reason recorded"
+_SCREENING_DECISION_CSV_HEADER = [
+    "decision_id", "decided_at_utc", "reviewer", "source", "run_id", "action", "criteria",
+    "publication_id", "pmid", "doi",
+    "previous_excluded", "previous_exclusion_reason", "previous_screening_stage",
+    "excluded", "exclusion_reason", "screening_stage",
+]
+
+
+def _as_utc(moment: datetime) -> datetime:
+    # decided_at is written as UTC; SQLite returns it without tzinfo.
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
+
+
+def _utc_stamp(moment: datetime, timespec: str = "seconds") -> str:
+    return _as_utc(moment).isoformat(timespec=timespec).replace("+00:00", "Z")
+
+
+def _decision_action(decision: ScreeningDecision) -> str:
+    if decision.excluded == decision.previous_excluded:
+        return "change"
+    return "exclude" if decision.excluded else "re-include"
+
+
+def _criteria_json(criteria: dict | None) -> str:
+    return "" if criteria is None else json.dumps(criteria, sort_keys=True)
+
+
+def _criteria_text(criteria: dict | None) -> str:
+    if criteria and set(criteria) == {"citation_threshold"}:
+        return f"citation count missing or at most {criteria['citation_threshold']}"
+    return f"criteria {_criteria_json(criteria) or 'not recorded'}"
+
+
+def _stage_label(stage: str | None) -> str:
+    return _STAGE_LABELS.get(stage, stage)
+
+
+def _decision_count_lines(decisions: tuple[ScreeningDecision, ...]) -> list[str]:
+    actions = Counter(_decision_action(d) for d in decisions)
+    return [
+        f"  Decisions logged: {len(decisions)}",
+        f"    Exclusions: {actions['exclude']}",
+        f"    Reversals (excluded record re-included): {actions['re-include']}",
+        f"    Reason or stage changes: {actions['change']}",
+        f"  First decision: {_utc_stamp(min(_as_utc(d.decided_at) for d in decisions))}",
+        f"  Last decision: {_utc_stamp(max(_as_utc(d.decided_at) for d in decisions))}",
+    ]
+
+
+def _exclusion_decision_lines(decisions: tuple[ScreeningDecision, ...]) -> list[str]:
+    by_stage: dict[str | None, Counter] = {}
+    for decision in decisions:
+        if decision.excluded:
+            reason = decision.exclusion_reason or _NO_REASON_LABEL
+            by_stage.setdefault(decision.screening_stage, Counter())[reason] += 1
+    if not by_stage:
+        return []
+    stage_order = [stage for stage in _STAGE_LABELS if stage in by_stage]
+    stage_order += sorted(stage for stage in by_stage if stage not in _STAGE_LABELS)
+    lines = ["  Exclusion decisions by stage and reason:"]
+    for stage in stage_order:
+        lines.append(f"    {_stage_label(stage)}: {sum(by_stage[stage].values())}")
+        lines.extend(_reason_count_lines(dict(by_stage[stage]), indent="      "))
+    return lines
+
+
+def _bulk_settings_text(reason: str | None, stage: str | None, reviewer: str | None) -> str:
+    reason_label = EXCLUSION_REASON_LABELS.get(reason, reason) if reason else _NO_REASON_LABEL
+    return f"(reason: {reason_label}; stage: {_stage_label(stage)}; reviewer: {reviewer or 'none recorded'})"
+
+
+def _bulk_step_lines(step: MethodologyStep, logged_rows: int) -> list[str]:
+    params = step.parameters or {}
+    criteria = {"citation_threshold": params["citation_threshold"]} if "citation_threshold" in params else None
+    lines = [
+        f"    {_utc_stamp(step.timestamp)} (run {params.get('run_id') or 'id not recorded'}): "
+        f"{params.get('matched')} matched, {params.get('excluded')} excluded, {params.get('skipped')} skipped; "
+        f"{_criteria_text(criteria)} "
+        f"{_bulk_settings_text(params.get('reason'), params.get('screening_stage'), params.get('reviewer'))}"
+    ]
+    if logged_rows != params.get("excluded"):
+        lines.append(
+            f"      Note: {_plural(logged_rows, 'decision row')} {'carries' if logged_rows == 1 else 'carry'} "
+            "this run id, "
+            f"but the step records {params.get('excluded')} exclusion(s)."
+        )
+    return lines
+
+
+def _bulk_rows_lines(run_id: str | None, members: list[ScreeningDecision]) -> list[str]:
+    first = members[0]
+    run_label = f"run {run_id}, no methodology step recorded" if run_id else "run id not recorded"
+    return [
+        f"    {_utc_stamp(first.decided_at)} ({run_label}): {_plural(len(members), 'record')} excluded with "
+        f"{_criteria_text(first.criteria)} "
+        f"{_bulk_settings_text(first.exclusion_reason, first.screening_stage, first.reviewer)}"
+    ]
+
+
+def _bulk_exclusion_lines(decisions: tuple[ScreeningDecision, ...], bulk_steps: list[MethodologyStep]) -> list[str]:
+    """One entry per bulk request: from its methodology step when there is one
+    (so a run that excluded nothing still shows), else from its decision rows."""
+    rows_by_run: dict[str | tuple, list[ScreeningDecision]] = {}
+    for d in decisions:
+        if d.source != BULK_EXCLUDE_SOURCE:
+            continue
+        # Rows without a run id fall back to their shared request timestamp.
+        key = d.run_id or (
+            _as_utc(d.decided_at), _criteria_json(d.criteria), d.exclusion_reason, d.screening_stage, d.reviewer,
+        )
+        rows_by_run.setdefault(key, []).append(d)
+    entries: list[tuple[datetime, list[str]]] = []
+    for step in bulk_steps:
+        logged_rows = len(rows_by_run.pop((step.parameters or {}).get("run_id"), []))
+        entries.append((_as_utc(step.timestamp), _bulk_step_lines(step, logged_rows)))
+    for key, members in rows_by_run.items():
+        run_id = key if isinstance(key, str) else None
+        entries.append((_as_utc(members[0].decided_at), _bulk_rows_lines(run_id, members)))
+    if not entries:
+        return []
+    return ["  Bulk exclusions:", *(line for _, group in sorted(entries, key=lambda e: e[0]) for line in group)]
+
+
+def _reviewer_lines(decisions: tuple[ScreeningDecision, ...]) -> list[str]:
+    labels = sorted({d.reviewer for d in decisions if d.reviewer is not None})
+    unlabelled = sum(1 for d in decisions if d.reviewer is None)
+    return [
+        f"  Reviewer labels: {', '.join(labels) if labels else 'none recorded'}",
+        f"  Decisions without a reviewer label: {unlabelled}",
+    ]
+
+
+def _screening_decision_lines(decision_log: ScreeningDecisionLog, bulk_steps: list[MethodologyStep]) -> list[str]:
+    """Summary of the append-only screening decision log and of every bulk
+    exclusion request, with what the log cannot show."""
+    decisions = decision_log.decisions
+    lines = ["SCREENING DECISION HISTORY (audit trail)"]
+    if decisions:
+        lines += _decision_count_lines(decisions)
+        lines += _exclusion_decision_lines(decisions)
+    else:
+        lines.append("  Decisions logged: 0")
+    lines += _bulk_exclusion_lines(decisions, bulk_steps)
+    if decisions:
+        lines += _reviewer_lines(decisions)
+        lines.append("  Per-decision log: the screening-decisions CSV in the export bundle.")
+    lines.append(
+        "  Not backfilled: decisions made before the audit trail existed "
+        f"(Alembic revision {DECISIONS_REVISION}) were not recorded."
+    )
+    unlogged = decision_log.unlogged_exclusions
+    if unlogged:
+        verb = "has" if unlogged == 1 else "have"
+        lines.append(f"    {_plural(unlogged, 'currently excluded record')} {verb} no logged decision.")
+    lines.append("")
+    return lines
+
+
+def generate_screening_decisions_csv(decisions: tuple[ScreeningDecision, ...] | list[ScreeningDecision]) -> str:
+    """Per-decision screening log, one row per ``ScreeningDecision`` in log order."""
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(_SCREENING_DECISION_CSV_HEADER)
+    for d in decisions:
+        pub = d.publication
+        writer.writerow([
+            d.id,
+            _utc_stamp(d.decided_at, timespec="microseconds"),
+            _csv_safe(d.reviewer or ""),
+            d.source,
+            d.run_id or "",
+            _decision_action(d),
+            _criteria_json(d.criteria),
+            d.publication_id,
+            _csv_safe(pub.pmid or "") if pub else "",
+            _csv_safe(pub.doi or "") if pub else "",
+            "true" if d.previous_excluded else "false",
+            _csv_safe(d.previous_exclusion_reason or ""),
+            d.previous_screening_stage or "",
+            "true" if d.excluded else "false",
+            _csv_safe(d.exclusion_reason or ""),
+            d.screening_stage or "",
+        ])
+    return output.getvalue()
+
+
+def _split_bulk_exclude_steps(steps: list[MethodologyStep]) -> tuple[list[MethodologyStep], list[MethodologyStep]]:
+    """Separate project-wide bulk-exclusion steps from the per-query pipeline.
+    They are filed under one query, so letting them into the pipeline would make
+    one a query's terminal step and skew the included and PRISMA totals."""
+    pipeline = [s for s in steps if s.phase != BULK_EXCLUDE_PHASE]
+    bulk = [s for s in steps if s.phase == BULK_EXCLUDE_PHASE]
+    return pipeline, bulk
+
+
 def generate_methodology(
     project_name: str,
     steps: list[MethodologyStep],
     exclusion_summary: ExclusionSummary | None = None,
+    decision_log: ScreeningDecisionLog | None = None,
 ) -> str:
     lines = [
         f'METHODOLOGY LOG — Project: "{project_name}"',
@@ -207,12 +410,17 @@ def generate_methodology(
         "Tool: BibMedEd (https://github.com/ata381/bibmeded)",
         "",
     ]
-    if not steps:
+    pipeline_steps, bulk_steps = _split_bulk_exclude_steps(steps)
+    history_log = decision_log or ScreeningDecisionLog(decisions=())
+    if not pipeline_steps:
         lines.append("No methodology steps recorded for this project.")
+        if bulk_steps or history_log.decisions or history_log.unlogged_exclusions:
+            lines.append("")
+            lines.extend(_screening_decision_lines(history_log, bulk_steps))
         return "\n".join(lines)
 
     current_phase = None
-    for step in steps:
+    for step in pipeline_steps:
         phase_header = _PHASE_LABELS.get(step.phase, step.phase.upper())
         if phase_header != current_phase:
             current_phase = phase_header
@@ -286,6 +494,8 @@ def generate_methodology(
         lines.append("")
 
     lines.extend(_screening_stage_lines(exclusion_summary))
+    if decision_log is not None or bulk_steps:
+        lines.extend(_screening_decision_lines(history_log, bulk_steps))
 
     # For a multi-query project, `steps` interleaves the per-query pipelines
     # (ordered query_id, step_order), so steps[-1] is only the *last query's*
@@ -293,7 +503,7 @@ def generate_methodology(
     # terminal step (the last one seen for that query_id) and sum their
     # records_out to get the true project-wide included-studies figure.
     terminal_step_by_query: dict[int, MethodologyStep] = {}
-    for step in steps:
+    for step in pipeline_steps:
         terminal_step_by_query[step.query_id] = step
     studies_included = sum(step.records_out for step in terminal_step_by_query.values())
 
@@ -309,7 +519,8 @@ def generate_prisma_svg(
     exclusion_summary: ExclusionSummary | None = None,
     included_count: int | None = None,
 ) -> str:
-    counts = compute_counts(steps, exclusion_summary=exclusion_summary, included_override=included_count)
+    pipeline_steps, _ = _split_bulk_exclude_steps(steps)
+    counts = compute_counts(pipeline_steps, exclusion_summary=exclusion_summary, included_override=included_count)
     return render_svg(counts, project_name)
 
 
@@ -318,20 +529,28 @@ def generate_bundle(
     pubs: list[Publication],
     steps: list[MethodologyStep],
     exclusion_summary: ExclusionSummary | None = None,
+    decision_log: ScreeningDecisionLog | None = None,
 ) -> bytes:
-    """Produce a single .zip containing CSV, RIS, JSON, methodology .txt, PRISMA .svg, and a manifest."""
+    """Produce a single .zip containing CSV, RIS, JSON, methodology .txt, PRISMA .svg, the
+    screening decision log CSV (when ``decision_log`` is given), and a manifest."""
     stamp = date.today().isoformat()
     slug = slugify(project_name) or "project"
     # pubs is already filtered to excluded == False by the caller (_get_project_and_pubs),
     # so len(pubs) is the authoritative "included" count.
     included_count = len(pubs)
+    decisions_name = f"{slug}-screening-decisions-{stamp}.csv"
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr(f"{slug}-{stamp}.csv", generate_csv(pubs))
         zf.writestr(f"{slug}-{stamp}.ris", generate_ris(pubs))
         zf.writestr(f"{slug}-{stamp}.json", generate_json(project_name, pubs))
-        zf.writestr(f"{slug}-methodology-{stamp}.txt", generate_methodology(project_name, steps, exclusion_summary))
+        zf.writestr(
+            f"{slug}-methodology-{stamp}.txt",
+            generate_methodology(project_name, steps, exclusion_summary, decision_log),
+        )
         zf.writestr(f"{slug}-prisma-{stamp}.svg", generate_prisma_svg(project_name, steps, exclusion_summary, included_count=included_count))
+        if decision_log is not None:
+            zf.writestr(decisions_name, generate_screening_decisions_csv(decision_log.decisions))
         manifest = (
             f"BibMedEd export bundle\n"
             f"Project: {project_name}\n"
@@ -344,5 +563,7 @@ def generate_bundle(
             f"  - {slug}-methodology-{stamp}.txt ({len(steps)} steps)\n"
             f"  - {slug}-prisma-{stamp}.svg\n"
         )
+        if decision_log is not None:
+            manifest += f"  - {decisions_name} ({_plural(len(decision_log.decisions), 'decision')})\n"
         zf.writestr("MANIFEST.txt", manifest)
     return buf.getvalue()
