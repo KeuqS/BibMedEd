@@ -118,9 +118,88 @@ df = pd.json_normalize(payload["publications"])
 df.to_parquet("corpus.parquet")
 ```
 
-For the full submission bundle (CSV + RIS + JSON + methodology + PRISMA SVG + screening
-decision log CSV + manifest in
-one .zip), hit `/api/projects/{id}/export/bundle`.
+For the full submission bundle (CSV + RIS + Web of Science plain text + JSON + methodology +
+PRISMA SVG + screening decision log CSV + manifest in one .zip), hit
+`/api/projects/{id}/export/bundle`.
+
+## Web of Science plain text for VOSviewer and Bibliometrix
+
+`GET /api/projects/{id}/export/wos` returns the included records in the Web of Science
+tagged plain-text format (`.txt`, UTF-8 with a byte-order mark, as Clarivate writes it).
+This is the format VOSviewer reads under *Create map → Read data from bibliographic
+database files → Web of Science*, and the one Bibliometrix reads with:
+
+```r
+library(bibliometrix)
+M <- convert2df("project-wos-2026-10-12.txt", dbsource = "wos", format = "plaintext")
+```
+
+The file opens with `FN Clarivate Analytics Web of Science` and `VR 1.0`. Each record starts
+with `PT J` and ends with `ER` and a blank line, and the file ends with `EF`. A field with
+several values (authors, addresses, cited references) puts one value per line, with
+continuation lines indented by three spaces. A field BibMedEd has no value for is left out,
+never written empty. Line breaks inside values are replaced by spaces, so a value cannot
+start a new tag or record.
+
+| Tag | Content | Source in BibMedEd |
+|---|---|---|
+| `PT` | Publication type, always `J` | constant |
+| `AU` | One author per line, `Surname, Initials` | author name |
+| `AF` | One author per line, `Surname, Given names` | author name |
+| `TI` | Title | title |
+| `SO` | Source title | journal name |
+| `DT` | Document type | publication type, as the source gave it |
+| `DE` | Author keywords, separated by `; ` | keywords the source supplied (not MeSH) |
+| `ID` | MeSH terms, separated by `; ` | MeSH terms |
+| `AB` | Abstract | abstract |
+| `C1` | One address per line, `[Authors] Affiliation, Country.` | author affiliations (see below) |
+| `CR` | One cited reference per line, `SURNAME I, YEAR, SOURCE, DOI <doi>` or `DOI <doi>` | reference list (see below) |
+| `NR` | Number of references the source reported | reference list |
+| `TC` | Times cited | citation count |
+| `SN`, `EI` | ISSN, eISSN | journal |
+| `PY` | Publication year | year |
+| `DI` | DOI | DOI |
+| `UT` | Unique record id, `<SOURCE>:<id>` such as `PUBMED:31234567` or `OPENALEX:W2741809807` | source and source-native id |
+| `PM` | PubMed ID, PubMed records only | PMID |
+
+Known gaps:
+
+- **Cited references.** BibMedEd stores each record's references as identifiers, not as
+  the `Author, Year, Source, Volume, Page, DOI` strings Web of Science writes. A reference
+  that resolves to a record in the same export, by DOI or by source-native id (an OpenAlex
+  ID, a Lens ID, a PMID) using the same matching as the citation analysis, is written in WoS
+  cited-reference form from that record: first-author surname and initials, year and journal
+  name, all upper case, then the DOI, for example
+  `DEMIR SA, 2019, MEDICAL EDUCATION, DOI 10.1111/medu.13900`. Parts the cited record lacks are
+  left out. Any other reference that is a DOI is written as bare `DOI <doi>`, because BibMedEd
+  holds nothing else about it. References that are neither are left out of `CR`; `NR` still
+  gives the full count, and the bundle's `MANIFEST.txt` states how many of the references
+  reached `CR`. PubMed does not return reference lists, so PubMed records have no `CR` or `NR`.
+- **What this means in each tool.** Bibliometrix's local-citation analysis (`histNetwork`,
+  `localCitations`) matches a `CR` entry against each record's first author, year and source
+  plus its DOI, so it counts citations between records of the same export and nothing else;
+  a bare `DOI <doi>` never matches. VOSviewer's co-citation maps of cited sources and cited
+  authors read the source and author out of each `CR` entry, so they are only populated by
+  the full-form, in-corpus references; bare `DOI <doi>` entries contribute neither. Both
+  tools see a citation network limited to the exported corpus.
+- **Author names.** PubMed names arrive as `Surname, Given`; a PubMed author without a comma
+  is a collective author and is written unchanged. Other sources give `Given Surname`, and
+  the last word is taken as the surname. Surnames with particles (`van der Berg`) and
+  organisation names from those sources are split at the last word too.
+- **Addresses.** Affiliations belong to an author record, not to a paper, and author
+  records are shared across the whole database by normalised name (all projects, all
+  sources). `C1` therefore lists every affiliation BibMedEd holds for that name, which can
+  include affiliations seen on other papers, or on another person with the same normalised
+  name. Each address is the stored affiliation text; when the text does not already end with
+  the stored country (aliases such as `England` for `UK` count as ending with it), the
+  country is appended, because VOSviewer takes the last comma-separated part as the country.
+  Every address ends with a period, because Bibliometrix splits addresses and matches
+  countries on it.
+- **`ID` holds MeSH terms**, not Clarivate's KeyWords Plus, and `UT` is not a Web of Science
+  accession number. Bibliometrix reads both as plain text, so analyses run, but
+  results labelled "Keywords Plus" are MeSH-based.
+- **Not exported:** language, volume, issue, pages, funding, reprint address, research
+  areas and cited-reference details, because BibMedEd does not store them.
 
 ## Batch over many queries
 
@@ -273,8 +352,8 @@ The endpoint is a toggle: calling it on an excluded record re-includes it and cl
 refused for the contradiction above). A record has one stage,
 the stage it was excluded at; to move an exclusion to the other stage, re-include it and
 exclude it again. `GET /api/projects/{id}/publications` returns `screening_stage` on every
-publication (`null` while it is included). The data exports (CSV, RIS, JSON) contain only
-included records, so stages appear in exports through the methodology log and the PRISMA
+publication (`null` while it is included). The data exports (CSV, RIS, Web of Science, JSON) contain
+only included records, so stages appear in exports through the methodology log and the PRISMA
 diagram counts.
 
 The flow diagram counts *reports sought for retrieval* as records screened minus

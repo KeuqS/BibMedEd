@@ -13,7 +13,11 @@ from collections import Counter
 from datetime import date, datetime, timezone
 
 from bibmeded.models import Publication, ScreeningDecision
+from bibmeded.models import Publication
+from bibmeded.models.author import Affiliation
+from bibmeded.models.keyword import KeywordType
 from bibmeded.models.methodology import MethodologyStep
+from bibmeded.services.cleaning import extract_country
 from bibmeded.services.prisma import ExclusionSummary, compute_counts, render_svg, summarize_exclusions
 from bibmeded.services.screening import BULK_EXCLUDE_PHASE, BULK_EXCLUDE_SOURCE, ScreeningDecisionLog
 
@@ -114,14 +118,19 @@ def generate_json(project_name: str, pubs: list[Publication]) -> str:
     return json.dumps(payload, indent=2, ensure_ascii=False)
 
 
+_LINE_BREAKS = re.compile(r"[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]+")
+
+
 def _ris_safe(value: str) -> str:
-    """Strip embedded CR/LF from a field value before writing it into an RIS
-    tag line. RIS records are newline-delimited, so an unescaped newline in an
+    """Replace embedded line breaks in a field value before writing it into an RIS
+    or WoS tag line. Both formats are newline-delimited, so an unescaped newline in an
     attacker-influenced field (title/author/journal/keyword) lets a malicious
     record inject arbitrary tag lines — including a fake ``ER  - `` that
     terminates the record early or a fake ``TY  - JOUR`` that starts a new one.
+    Every separator Python's ``str.splitlines`` honours is covered, not only CR/LF,
+    so readers with wider line-break rules cannot be split either.
     """
-    return re.sub(r"[\r\n]+", " ", value).strip()
+    return _LINE_BREAKS.sub(" ", value).strip()
 
 
 def generate_ris(pubs: list[Publication]) -> str:
@@ -145,6 +154,211 @@ def generate_ris(pubs: list[Publication]) -> str:
         lines.append("ER  - ")
         lines.append("")
     return "\n".join(lines)
+
+
+# Genuine Web of Science plain-text exports start with a UTF-8 BOM. Writing one keeps
+# the file in the shape VOSviewer and bibliometrix already parse, and stops tools that
+# fall back to the platform code page from misreading non-ASCII names.
+_WOS_BOM = "\ufeff"
+_WOS_HEADER = ("FN Clarivate Analytics Web of Science", "VR 1.0")
+_WOS_CONTINUATION = "   "
+_DOI_PATTERN = re.compile(r"^10\.\d{4,9}/\S+$", re.IGNORECASE)
+
+
+def _wos_tag(tag: str, values: list[str]) -> list[str]:
+    cleaned = [v for v in (_ris_safe(value) for value in values) if v]
+    if not cleaned:
+        return []
+    return [f"{tag} {cleaned[0]}", *(f"{_WOS_CONTINUATION}{v}" for v in cleaned[1:])]
+
+
+def _wos_name_parts(name: str, source_database: str) -> tuple[str, str]:
+    """Split a stored author name into (surname, given names).
+
+    PubMed stores persons as "Surname, Given" and collective authors without a
+    comma, so a comma-less PubMed name is kept whole. Other adapters store
+    "Given Surname", where the last token is taken as the surname.
+    """
+    name = " ".join(_ris_safe(name).split())
+    if "," in name:
+        surname, given = name.split(",", 1)
+        return surname.strip(), given.strip()
+    if source_database == "pubmed" or " " not in name:
+        return name, ""
+    given, surname = name.rsplit(" ", 1)
+    return surname, given
+
+
+def _wos_initials(given: str) -> str:
+    return "".join(token[0].upper() for token in re.split(r"[\s.\-]+", given) if token)
+
+
+def _wos_short_name(surname: str, given: str) -> str:
+    initials = _wos_initials(given)
+    return f"{surname}, {initials}" if initials else surname
+
+
+def _wos_full_name(surname: str, given: str) -> str:
+    return f"{surname}, {given}" if given else surname
+
+
+def _wos_address(affiliation: Affiliation) -> str:
+    """One C1 address: the stored affiliation text, the stored country appended when
+    the text does not already name it, and a closing period.
+
+    bibliometrix joins C1 lines with spaces and splits addresses on ".", and VOSviewer
+    reads the country from the last comma-separated part, so both the period and a
+    trailing country are load-bearing. The "already names it" test reuses
+    ``extract_country`` so an alias ("England" stored as "UK") is not appended twice.
+    """
+    address = _ris_safe(affiliation.name or "").rstrip(". ")
+    if not address:
+        return ""
+    country = _ris_safe(affiliation.country or "")
+    if country and extract_country(address) != country:
+        address = f"{address}, {country}"
+    return f"{address}."
+
+
+def _wos_addresses(pub: Publication, short_names: list[str]) -> list[str]:
+    authors_by_address: dict[str, list[str]] = {}
+    for author, short_name in zip(pub.authors, short_names):
+        if not short_name:
+            continue
+        for affiliation in author.affiliations:
+            address = _wos_address(affiliation)
+            if not address:
+                continue
+            names = authors_by_address.setdefault(address, [])
+            if short_name not in names:
+                names.append(short_name)
+    return [f"[{'; '.join(names)}] {address}" for address, names in authors_by_address.items()]
+
+
+def _wos_keywords(pub: Publication, kind: KeywordType) -> str:
+    terms = (_ris_safe(k.term or "") for k in pub.keywords if k.type == kind)
+    return "; ".join(term for term in terms if term)
+
+
+def _wos_corpus_index(pubs: list[Publication]) -> dict[str, Publication]:
+    """Exported records that have a DOI, keyed by lowercased DOI and source-native id."""
+    index: dict[str, Publication] = {}
+    for pub in pubs:
+        if not pub.doi:
+            continue
+        index[pub.doi.lower()] = pub
+        if pub.pmid:
+            index[pub.pmid.lower()] = pub
+    return index
+
+
+def _wos_cited_reference_form(cited: Publication) -> str:
+    """WoS cited-reference string ``SURNAME I, YEAR, SOURCE, DOI x`` for a record in the export.
+
+    bibliometrix's histNetwork matches each CR entry against a record's SR (first
+    author, year, source) plus its DOI, so in-corpus citations need this form; a bare
+    ``DOI x`` never produces a local citation.
+    """
+    parts: list[str] = []
+    first_author = next((a for a in cited.authors if _ris_safe(a.name or "")), None)
+    if first_author is not None:
+        surname, given = _wos_name_parts(first_author.name, cited.source_database)
+        parts.append(f"{surname} {_wos_initials(given)}".strip().upper())
+    if cited.year:
+        parts.append(str(cited.year))
+    source = _ris_safe(cited.journal.name or "") if cited.journal else ""
+    if source:
+        parts.append(source.upper())
+    parts.append(f"DOI {cited.doi.lower()}")
+    return ", ".join(parts)
+
+
+def _wos_references(pub: Publication) -> list:
+    """The JSON column only means something as a list; a legacy string or scalar
+    value would otherwise be iterated character by character."""
+    return pub.external_references if isinstance(pub.external_references, list) else []
+
+
+def _wos_cited_references(pub: Publication, corpus_index: dict[str, Publication]) -> list[str]:
+    """CR entries for ``pub``.
+
+    ``external_references`` holds source-native identifiers. A reference that resolves
+    to a record in this export with a DOI (by DOI or by source-native id, the same
+    matching the citation analysis uses) gets the full WoS form; any other DOI is
+    written as bare ``DOI x``. The rest have no WoS form, so ``NR`` carries the full
+    count and the bundle manifest reports the shortfall.
+    """
+    cited: list[str] = []
+    seen_dois: set[str] = set()
+    for raw_ref in _wos_references(pub):
+        ref = str(raw_ref).strip().lower()
+        target = corpus_index.get(ref)
+        if target is not None:
+            doi = target.doi.lower()
+        elif _DOI_PATTERN.match(ref):
+            doi = ref
+        else:
+            continue
+        if doi in seen_dois:
+            continue
+        seen_dois.add(doi)
+        cited.append(_wos_cited_reference_form(target) if target is not None else f"DOI {doi}")
+    return cited
+
+
+def wos_reference_coverage(pubs: list[Publication]) -> tuple[int, int]:
+    """(cited references written to CR, references the sources reported)."""
+    corpus_index = _wos_corpus_index(pubs)
+    written = sum(len(_wos_cited_references(pub, corpus_index)) for pub in pubs)
+    reported = sum(len(_wos_references(pub)) for pub in pubs)
+    return written, reported
+
+
+def _wos_record(pub: Publication, corpus_index: dict[str, Publication]) -> list[str]:
+    name_parts = [_wos_name_parts(author.name or "", pub.source_database) for author in pub.authors]
+    short_names = [_wos_short_name(surname, given) for surname, given in name_parts]
+    references = _wos_references(pub)
+    journal = pub.journal
+    return [
+        "PT J",
+        *_wos_tag("AU", short_names),
+        *_wos_tag("AF", [_wos_full_name(surname, given) for surname, given in name_parts]),
+        *_wos_tag("TI", [pub.title or ""]),
+        *_wos_tag("SO", [journal.name if journal else ""]),
+        *_wos_tag("DT", [pub.publication_type or ""]),
+        *_wos_tag("DE", [_wos_keywords(pub, KeywordType.author_keyword)]),
+        *_wos_tag("ID", [_wos_keywords(pub, KeywordType.mesh_term)]),
+        *_wos_tag("AB", [pub.abstract or ""]),
+        *_wos_tag("C1", _wos_addresses(pub, short_names)),
+        *_wos_tag("CR", _wos_cited_references(pub, corpus_index)),
+        *_wos_tag("NR", [str(len(references))] if references else []),
+        *_wos_tag("TC", [str(pub.citation_count)] if pub.citation_count is not None else []),
+        *_wos_tag("SN", [journal.issn or ""] if journal else []),
+        *_wos_tag("EI", [journal.e_issn or ""] if journal else []),
+        *_wos_tag("PY", [str(pub.year)] if pub.year else []),
+        *_wos_tag("DI", [pub.doi or ""]),
+        *_wos_tag("UT", [f"{pub.source_database.upper()}:{pub.pmid}"] if pub.pmid else []),
+        *_wos_tag("PM", [pub.pmid] if pub.source_database == "pubmed" else []),
+        "ER",
+        "",
+    ]
+
+
+def generate_wos_plaintext(pubs: list[Publication]) -> str:
+    """Web of Science tagged plain text, the input VOSviewer and bibliometrix
+    (``convert2df(dbsource="wos", format="plaintext")``) read.
+
+    Every value is one line; multi-valued fields (AU, AF, C1, CR) put one value per
+    line with 3-space continuation lines, records end with ``ER`` and a blank line,
+    and the file ends with ``EF``. Field mapping and known gaps are documented in
+    ``docs/scripting.md``.
+    """
+    corpus_index = _wos_corpus_index(pubs)
+    lines = [*_WOS_HEADER]
+    for pub in pubs:
+        lines.extend(_wos_record(pub, corpus_index))
+    lines.append("EF")
+    return _WOS_BOM + "\n".join(lines) + "\n"
 
 
 EXCLUSION_REASON_LABELS = {
@@ -574,18 +788,20 @@ def generate_bundle(
     decision_log: ScreeningDecisionLog | None = None,
     author_productivity: dict | None = None,
 ) -> bytes:
-    """Produce a single .zip containing CSV, RIS, JSON, methodology .txt, PRISMA .svg, the
-    screening decision log CSV (when ``decision_log`` is given), and a manifest."""
+    """Produce a single .zip containing CSV, RIS, WoS plain text, JSON, methodology .txt, PRISMA .svg,
+    the screening decision log CSV (when ``decision_log`` is given), and a manifest."""
     stamp = date.today().isoformat()
     slug = slugify(project_name) or "project"
     # pubs is already filtered to excluded == False by the caller (_get_project_and_pubs),
     # so len(pubs) is the authoritative "included" count.
     included_count = len(pubs)
     decisions_name = f"{slug}-screening-decisions-{stamp}.csv"
+    cited_written, cited_reported = wos_reference_coverage(pubs)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr(f"{slug}-{stamp}.csv", generate_csv(pubs))
         zf.writestr(f"{slug}-{stamp}.ris", generate_ris(pubs))
+        zf.writestr(f"{slug}-wos-{stamp}.txt", generate_wos_plaintext(pubs))
         zf.writestr(f"{slug}-{stamp}.json", generate_json(project_name, pubs))
         zf.writestr(
             f"{slug}-methodology-{stamp}.txt",
@@ -602,6 +818,9 @@ def generate_bundle(
             f"Included files:\n"
             f"  - {slug}-{stamp}.csv ({len(pubs)} records)\n"
             f"  - {slug}-{stamp}.ris ({len(pubs)} records)\n"
+            f"  - {slug}-wos-{stamp}.txt ({len(pubs)} records, Web of Science plain text; "
+            f"CR lists {cited_written} of {cited_reported} cited references, "
+            f"only those with a DOI or matching an in-corpus record with a DOI)\n"
             f"  - {slug}-{stamp}.json ({len(pubs)} records, schema_version={EXPORT_SCHEMA_VERSION})\n"
             f"  - {slug}-methodology-{stamp}.txt ({len(steps)} steps)\n"
             f"  - {slug}-prisma-{stamp}.svg\n"
