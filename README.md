@@ -23,6 +23,7 @@
   <a href="https://ata381.github.io/BibMedEd/case-study/">Case Study</a> &bull;
   <a href="https://ata381.github.io/BibMedEd/">Documentation</a> &bull;
   <a href="https://ata381.github.io/BibMedEd/deploy/">Self-Hosting</a> &bull;
+  <a href="https://ata381.github.io/BibMedEd/troubleshooting/">Troubleshooting</a> &bull;
   <a href="https://ata381.github.io/BibMedEd/adapters/">Write an Adapter</a> &bull;
   <a href="https://render.com/deploy?repo=https://github.com/ata381/BibMedEd">Deploy to Cloud</a> &bull;
   <a href="ROADMAP.md">Roadmap</a> &bull;
@@ -60,7 +61,7 @@
 - **Standard exports** — .RIS (Zotero/EndNote), .CSV (Excel/Sheets), versioned .JSON, methodology log, PRISMA 2020 flow diagram (.svg), and a single-click `.zip` bundle of all five
 - **Programmatic access** — Auto-generated OpenAPI spec at `/openapi.json`, interactive Swagger UI at `/docs`, ReDoc at `/redoc`. Analysis responses carry a `schema_version` field for downstream pinning.
 - **Self-hostable** — Single `docker compose up` on any lab server, no cloud account needed
-- **Result cap** — Default 2,000 records (configurable up to 10,000); results page warns when upstream returned more than was fetched so truncation is never silent
+- **Result cap** — Default 2,000 records (configurable up to 10,000). For PubMed below 10,000 the results page warns when upstream returned more than was fetched; for other sources and for PubMed at 10,000 truncation is not yet flagged ([#151](https://github.com/ata381/BibMedEd/issues/151)), so treat a count equal to the cap as truncated and check it with `bibmeded search --dry-run`
 
 ## Architecture
 
@@ -104,7 +105,7 @@ or the next time you choose **Explore sample project**; searches you ran yoursel
 
 **CLI only, no Docker:** `pip install bibmeded` (Python 3.12+, [PyPI](https://pypi.org/project/bibmeded/)), then `bibmeded search "medical education" --dry-run` to estimate result counts from a terminal or notebook. See [Scripting](https://ata381.github.io/BibMedEd/scripting/#install-from-pypi-cli-only).
 
-See the full [Self-Hosting Guide](https://ata381.github.io/BibMedEd/deploy/) for configuration, reset, and dev setup.
+See the full [Self-Hosting Guide](https://ata381.github.io/BibMedEd/deploy/) for configuration, reset, and dev setup. Stuck on a port clash, a PubMed rate limit, a missing Lens key or a search that never starts? See [Troubleshooting & FAQ](https://ata381.github.io/BibMedEd/troubleshooting/).
 
 ## Deploy to Cloud
 
